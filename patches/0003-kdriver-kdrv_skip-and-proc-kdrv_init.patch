@@ -1,0 +1,200 @@
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/base/base_device.c b/linux-and-kdriver_okapi-3/kdriver/core/base/base_device.c
+index 64b93bf14..3bd7e1d96 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/base/base_device.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/base/base_device.c
+@@ -37,6 +37,10 @@
+ #include <linux/fs.h>
+ #include <linux/cdev.h>
+ #include <linux/slab.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/kallsyms.h>
++#include <linux/string.h>
+ #include <asm/uaccess.h>
+ #include "debug_util.h"
+ 
+@@ -358,6 +362,67 @@ static	LX_DEVICE_INIT_DATA_T	g_device_init_table[] =
+ /*========================================================================================
+ 	Implementation Group
+ ========================================================================================*/
++/*
++ * Because KDRV_GLOBAL_LINK is defined, the entries below are NOT registered as
++ * kernel initcalls -- module_init() is compiled out and this table is walked
++ * directly instead. That means initcall_blacklist= cannot reach them. This
++ * gives back the equivalent knob:
++ *
++ *   kdrv_skip=GPU_Init,PE_Init,DE_Init
++ *
++ * Names are matched against the kallsyms name of the init function, the same
++ * way initcall_blacklist does it, so they are just the symbol names from the
++ * table above.
++ *
++ * GPU_Init in particular: skipping it leaves 0xC4250000 unclaimed so the
++ * panfrost DRM driver can bind to the gpu@c4250000 device tree node instead
++ * of kbase. Without this both drivers fight over the same registers.
++ */
++/* Not __initdata: kdrv_skipped() is reached from BASE_DEV_Init(), which is
++ * not an __init function, so this must outlive free_initmem(). */
++static char	kdrv_skip_list[256];
++
++static int __init kdrv_skip_setup ( char *str )
++{
++	strlcpy ( kdrv_skip_list, str, sizeof(kdrv_skip_list) );
++	return 1;
++}
++__setup ( "kdrv_skip=", kdrv_skip_setup );
++
++static bool	kdrv_skipped ( void *fn )
++{
++	char		sym[KSYM_NAME_LEN];
++	const char	*p = kdrv_skip_list;
++	char		*cut;
++	size_t		len;
++
++	if ( !kdrv_skip_list[0] || !fn )
++		return false;
++
++	sprint_symbol_no_offset ( sym, (unsigned long)fn );
++
++	/* sprint_symbol may append " [module]"; match on the bare name */
++	cut = strchr ( sym, ' ' );
++	if ( cut )
++		*cut = '\0';
++
++	while ( *p )
++	{
++		cut = strchr ( p, ',' );
++		len = cut ? (size_t)(cut - p) : strlen(p);
++
++		if ( len && len == strlen(sym) && !strncmp ( p, sym, len ) )
++		{
++			printk ( "kdrv: skipping %s\n", sym );
++			return true;
++		}
++
++		p = cut ? cut + 1 : p + len;
++	}
++
++	return false;
++}
++
+ void		BASE_DEV_PreInit	( void )
+ {
+ 	int		i;
+@@ -365,10 +430,103 @@ void		BASE_DEV_PreInit	( void )
+ 
+ 	for ( i=0; i< num_devices; i++ )
+ 	{
++		/* Skip Cfg too: a module we are not going to Init must not be
++		 * half-configured, or its registers get poked anyway. */
++		if ( kdrv_skipped ( g_device_init_table[i].InitModule ) ) continue;
+ 		if ( g_device_init_table[i].CfgModule) g_device_init_table[i].CfgModule();
+ 	}
+ }
+ 
++/*
++ * /proc/kdrv_init -- run a subsystem's Cfg+Init on demand, by name.
++ * Read it to list the available names (skipped ones are marked).
++ */
++static ssize_t	kdrv_init_write ( struct file *file, const char __user *buf,
++				  size_t count, loff_t *ppos )
++{
++	char		want[KSYM_NAME_LEN];
++	char		sym[KSYM_NAME_LEN];
++	char		*cut;
++	int		i;
++	int		num_devices = NELEMENTS(g_device_init_table);
++
++	if ( count == 0 || count >= sizeof(want) )
++		return -EINVAL;
++
++	if ( copy_from_user ( want, buf, count ) )
++		return -EFAULT;
++
++	want[count] = '\0';
++	cut = strchr ( want, '\n' );
++	if ( cut )
++		*cut = '\0';
++
++	if ( !want[0] )
++		return -EINVAL;
++
++	for ( i = 0; i < num_devices; i++ )
++	{
++		if ( !g_device_init_table[i].InitModule )
++			continue;
++
++		sprint_symbol_no_offset ( sym, (unsigned long)g_device_init_table[i].InitModule );
++		cut = strchr ( sym, ' ' );
++		if ( cut )
++			*cut = '\0';
++
++		if ( strcmp ( sym, want ) )
++			continue;
++
++		printk ( "kdrv: running %s on demand\n", sym );
++		if ( g_device_init_table[i].CfgModule )
++			g_device_init_table[i].CfgModule();
++		g_device_init_table[i].InitModule();
++		printk ( "kdrv: %s done\n", sym );
++
++		return count;
++	}
++
++	printk ( "kdrv: no such module '%s'\n", want );
++	return -ENOENT;
++}
++
++static int	kdrv_init_show ( struct seq_file *m, void *v )
++{
++	char		sym[KSYM_NAME_LEN];
++	char		*cut;
++	int		i;
++	int		num_devices = NELEMENTS(g_device_init_table);
++
++	for ( i = 0; i < num_devices; i++ )
++	{
++		if ( !g_device_init_table[i].InitModule )
++			continue;
++
++		sprint_symbol_no_offset ( sym, (unsigned long)g_device_init_table[i].InitModule );
++		cut = strchr ( sym, ' ' );
++		if ( cut )
++			*cut = '\0';
++
++		seq_printf ( m, "%s%s\n", sym,
++			     kdrv_skipped ( g_device_init_table[i].InitModule ) ? " (skipped)" : "" );
++	}
++
++	return 0;
++}
++
++static int	kdrv_init_open ( struct inode *inode, struct file *file )
++{
++	return single_open ( file, kdrv_init_show, NULL );
++}
++
++static const struct file_operations kdrv_init_fops = {
++	.open		= kdrv_init_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++	.write		= kdrv_init_write,
++};
++
+ void		BASE_DEV_Init	( void )
+ {
+ 	int		i;
+@@ -376,8 +534,12 @@ void		BASE_DEV_Init	( void )
+ 
+ 	for ( i=0; i< num_devices; i++ )
+ 	{
++		if ( kdrv_skipped ( g_device_init_table[i].InitModule ) ) continue;
+ 		if ( g_device_init_table[i].InitModule ) g_device_init_table[i].InitModule();
+ 	}
++
++	if ( !proc_create ( "kdrv_init", 0600, NULL, &kdrv_init_fops ) )
++		printk ( "kdrv: could not create /proc/kdrv_init\n" );
+ }
+ 
+ void		BASE_DEV_Cleanup	( void )

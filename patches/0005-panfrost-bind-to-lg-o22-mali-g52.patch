@@ -1,0 +1,240 @@
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.c
+index 413bf314a..0c9563ce7 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -42,18 +42,26 @@ static int panfrost_clk_init(struct panfrost_device *pfdev)
+ 	int err;
+ 	unsigned long rate;
+ 
+-	pfdev->clock = devm_clk_get(pfdev->dev, NULL);
++	/* LG o22: gpu@c4250000 declares no clocks -- the GPU is already clocked
++	 * by firmware before Linux starts, which is why the vendor kbase
++	 * platform backend for this SoC has empty power callbacks. Treat a
++	 * missing clock as "already running" rather than a probe failure. */
++	pfdev->clock = devm_clk_get_optional(pfdev->dev, NULL);
+ 	if (IS_ERR(pfdev->clock)) {
+ 		dev_err(pfdev->dev, "get clock failed %ld\n", PTR_ERR(pfdev->clock));
+ 		return PTR_ERR(pfdev->clock);
+ 	}
+ 
+-	rate = clk_get_rate(pfdev->clock);
+-	dev_info(pfdev->dev, "clock rate = %lu\n", rate);
++	if (pfdev->clock) {
++		rate = clk_get_rate(pfdev->clock);
++		dev_info(pfdev->dev, "clock rate = %lu\n", rate);
+ 
+-	err = clk_prepare_enable(pfdev->clock);
+-	if (err)
+-		return err;
++		err = clk_prepare_enable(pfdev->clock);
++		if (err)
++			return err;
++	} else {
++		dev_info(pfdev->dev, "no clock in DT, assuming firmware-clocked\n");
++	}
+ 
+ 	pfdev->bus_clock = devm_clk_get_optional(pfdev->dev, "bus");
+ 	if (IS_ERR(pfdev->bus_clock)) {
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.h b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.h
+index 9c39b9794..54952b41f 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.h
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_device.h
+@@ -8,6 +8,7 @@
+ #include <linux/atomic.h>
+ #include <linux/io-pgtable.h>
+ #include <linux/spinlock.h>
++#include <linux/platform_device.h>
+ #include <drm/drm_device.h>
+ #include <drm/drm_mm.h>
+ #include <drm/gpu_scheduler.h>
+@@ -28,6 +29,8 @@ struct panfrost_features {
+ 	u64 tiler_present;
+ 	u64 l2_present;
+ 	u64 stack_present;
++	/* set once we learn this GPU has no usable core-stack domain */
++	bool stack_unusable;
+ 	u32 as_present;
+ 	u32 js_present;
+ 
+@@ -152,4 +155,29 @@ int panfrost_device_suspend(struct device *dev);
+ 
+ const char *panfrost_exception_name(struct panfrost_device *pfdev, u32 exception_code);
+ 
++
++/*
++ * Look an interrupt up by name, tolerating the capitalisation used by ARM's
++ * own kbase device trees. Panfrost's bindings say "job"/"mmu"/"gpu", but
++ * vendor DTs written against kbase (LG o22 among them) spell them
++ * "JOB"/"MMU"/"GPU", and platform_get_irq_byname() is case sensitive.
++ * Falls back to the positional lookup, whose order is the same either way.
++ */
++static inline int panfrost_get_irq(struct platform_device *pdev,
++				   const char *lower, const char *upper,
++				   unsigned int index)
++{
++	int irq;
++
++	irq = platform_get_irq_byname(pdev, lower);
++	if (irq > 0)
++		return irq;
++
++	irq = platform_get_irq_byname(pdev, upper);
++	if (irq > 0)
++		return irq;
++
++	return platform_get_irq(pdev, index);
++}
++
+ #endif
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_drv.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_drv.c
+index b4bab8647..c6b70f9bc 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -660,6 +660,11 @@ static int panfrost_remove(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id dt_match[] = {
++	/* LG o22 (lg1213): the stock DTB declares gpu@c4250000 as
++	 * "arm,mali-midgard" and the GPU is a Bifrost G52. The actual model
++	 * is read from GPU_ID at probe, so the compatible only has to match. */
++	{ .compatible = "arm,mali-midgard" },
++	{ .compatible = "arm,mali-bifrost" },
+ 	{ .compatible = "arm,mali-t604" },
+ 	{ .compatible = "arm,mali-t624" },
+ 	{ .compatible = "arm,mali-t628" },
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_gpu.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_gpu.c
+index 0d39a201c..9889d8ffd 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_gpu.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_gpu.c
+@@ -310,29 +310,81 @@ static void panfrost_gpu_init_features(struct panfrost_device *pfdev)
+ 		 pfdev->features.shader_present, pfdev->features.l2_present);
+ }
+ 
+-void panfrost_gpu_power_on(struct panfrost_device *pfdev)
++/*
++ * Power one domain up and wait for it to report ready.
++ *
++ * Upstream polls for 1ms total. That is not enough on every SoC, and because
++ * the original code ORed four results into a single "error powering up gpu"
++ * there was no way to tell which domain failed or what it actually read back.
++ * Report each one separately, and give it 100ms.
++ */
++static int panfrost_gpu_power_domain(struct panfrost_device *pfdev,
++				     const char *name, u32 pwron_reg,
++				     u32 ready_reg, u32 present, bool fatal)
+ {
+-	int ret;
+ 	u32 val;
++	int ret;
++
++	if (!present)
++		return 0;
++
++	gpu_write(pfdev, pwron_reg, present);
++
++	ret = readl_relaxed_poll_timeout(pfdev->iomem + ready_reg,
++					 val, val == present, 100,
++					 fatal ? 100000 : 5000);
++	if (ret)
++		dev_printk(fatal ? KERN_ERR : KERN_INFO, pfdev->dev,
++			"%s power-on timeout after 100ms: want %#x, READY reads %#x\n",
++			name, present,
++			readl_relaxed(pfdev->iomem + ready_reg));
++	else
++		dev_dbg(pfdev->dev, "%s powered on (%#x)\n", name, present);
++
++	return ret;
++}
++
++void panfrost_gpu_power_on(struct panfrost_device *pfdev)
++{
++	int ret = 0;
+ 
+ 	panfrost_gpu_init_quirks(pfdev);
+ 
+-	/* Just turn on everything for now */
+-	gpu_write(pfdev, L2_PWRON_LO, pfdev->features.l2_present);
+-	ret = readl_relaxed_poll_timeout(pfdev->iomem + L2_READY_LO,
+-		val, val == pfdev->features.l2_present, 100, 1000);
++	/* What state did we inherit? If firmware already powered the GPU the
++	 * READY registers are non-zero before we touch anything. */
++	dev_dbg(pfdev->dev,
++		 "power-on entry: L2_READY=%#x SHADER_READY=%#x TILER_READY=%#x STACK_READY=%#x\n",
++		 readl_relaxed(pfdev->iomem + L2_READY_LO),
++		 readl_relaxed(pfdev->iomem + SHADER_READY_LO),
++		 readl_relaxed(pfdev->iomem + TILER_READY_LO),
++		 readl_relaxed(pfdev->iomem + STACK_READY_LO));
+ 
+-	gpu_write(pfdev, STACK_PWRON_LO, pfdev->features.stack_present);
+-	ret |= readl_relaxed_poll_timeout(pfdev->iomem + STACK_READY_LO,
+-		val, val == pfdev->features.stack_present, 100, 1000);
++	ret |= panfrost_gpu_power_domain(pfdev, "L2", L2_PWRON_LO,
++					 L2_READY_LO, pfdev->features.l2_present, true);
+ 
+-	gpu_write(pfdev, SHADER_PWRON_LO, pfdev->features.shader_present);
+-	ret |= readl_relaxed_poll_timeout(pfdev->iomem + SHADER_READY_LO,
+-		val, val == pfdev->features.shader_present, 100, 1000);
++	/*
++	 * Core stacks are a Midgard-era thing. This GPU (Bifrost G52) has none,
++	 * and GPU_STACK_PRESENT is unimplemented -- it reads back the same
++	 * bitmap as SHADER_PRESENT, so we would sit waiting on a domain that
++	 * does not exist. kbase gates this on the core-stack hardware feature;
++	 * panfrost has no such gate, so failure here is advisory, not fatal.
++	 */
++	if (!pfdev->features.stack_unusable &&
++	    panfrost_gpu_power_domain(pfdev, "stack", STACK_PWRON_LO,
++				      STACK_READY_LO,
++				      pfdev->features.stack_present, false)) {
++		/* Discover this once. Runtime PM powers the GPU up and down
++		 * constantly, and blocking on a domain that will never come
++		 * ready would cost that timeout on every single wake. */
++		pfdev->features.stack_unusable = true;
++		dev_info(pfdev->dev,
++			 "no core-stack domain on this GPU, skipping it from now on\n");
++	}
+ 
+-	gpu_write(pfdev, TILER_PWRON_LO, pfdev->features.tiler_present);
+-	ret |= readl_relaxed_poll_timeout(pfdev->iomem + TILER_READY_LO,
+-		val, val == pfdev->features.tiler_present, 100, 1000);
++	ret |= panfrost_gpu_power_domain(pfdev, "shader", SHADER_PWRON_LO,
++					 SHADER_READY_LO, pfdev->features.shader_present, true);
++	ret |= panfrost_gpu_power_domain(pfdev, "tiler", TILER_PWRON_LO,
++					 TILER_READY_LO, pfdev->features.tiler_present, true);
+ 
+ 	if (ret)
+ 		dev_err(pfdev->dev, "error powering up gpu");
+@@ -359,7 +411,7 @@ int panfrost_gpu_init(struct panfrost_device *pfdev)
+ 	dma_set_mask_and_coherent(pfdev->dev,
+ 		DMA_BIT_MASK(FIELD_GET(0xff00, pfdev->features.mmu_features)));
+ 
+-	irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "gpu");
++	irq = panfrost_get_irq(to_platform_device(pfdev->dev), "gpu", "GPU", 2);
+ 	if (irq <= 0)
+ 		return -ENODEV;
+ 
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_job.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_job.c
+index 9f770d454..aed9b4ace 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -510,7 +510,7 @@ int panfrost_job_init(struct panfrost_device *pfdev)
+ 
+ 	spin_lock_init(&js->job_lock);
+ 
+-	irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "job");
++	irq = panfrost_get_irq(to_platform_device(pfdev->dev), "job", "JOB", 0);
+ 	if (irq <= 0)
+ 		return -ENODEV;
+ 
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_mmu.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index b17f3022d..a32a903a7 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -635,7 +635,7 @@ int panfrost_mmu_init(struct panfrost_device *pfdev)
+ {
+ 	int err, irq;
+ 
+-	irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "mmu");
++	irq = panfrost_get_irq(to_platform_device(pfdev->dev), "mmu", "MMU", 1);
+ 	if (irq <= 0)
+ 		return -ENODEV;
+ 

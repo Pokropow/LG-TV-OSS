@@ -1,0 +1,143 @@
+#!/bin/bash
+# Prepare a USB stick as the persistent Alpine root for the TV.
+# Run on your PC, as root.
+#
+#   ./prepare-alpine-usb.sh /dev/sdX
+#
+# Creates one GPT partition labelled "alpineroot", ext4, unpacks the Alpine
+# aarch64 minirootfs into it and configures console/network. The TV's kernel
+# and boot-initramfs stay in /home/root on the TV; this stick holds the OS.
+set -euo pipefail
+
+DEV="${1:-}"
+ALPINE_VER="${ALPINE_VER:-3.21.3}"
+ALPINE_BRANCH="v${ALPINE_VER%.*}"
+LABEL="${LABEL:-alpineroot}"
+ARCH=aarch64
+TARBALL="alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz"
+URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ARCH}/${TARBALL}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+MNT="$(mktemp -d)"
+
+die() { echo "error: $*" >&2; exit 1; }
+[ -n "$DEV" ] || die "usage: $0 /dev/sdX   (the whole device, not a partition)"
+[ "$(id -u)" = 0 ] || die "must run as root (mkfs/mount)"
+[ -b "$DEV" ] || die "$DEV is not a block device"
+case "$DEV" in *[0-9]) die "$DEV looks like a partition; give the whole device";; esac
+
+BASE="$(basename "$DEV")"
+REMOVABLE="$(cat "/sys/block/$BASE/removable" 2>/dev/null || echo 0)"
+SIZE="$(lsblk -bdno SIZE "$DEV" | tr -d ' ')"
+MODEL="$(lsblk -dno MODEL "$DEV" 2>/dev/null | sed 's/ *$//')"
+
+echo
+echo "  device   : $DEV"
+echo "  model    : ${MODEL:-unknown}"
+echo "  size     : $(numfmt --to=iec "$SIZE" 2>/dev/null || echo "$SIZE bytes")"
+echo "  removable: $REMOVABLE"
+echo
+lsblk "$DEV" || true
+echo
+
+# Refuse fixed disks unless overridden -- the common way to lose a laptop.
+if [ "$REMOVABLE" != "1" ] && [ "${FORCE:-}" != "1" ]; then
+	die "$DEV is not removable. If you are certain, re-run with FORCE=1"
+fi
+
+echo "ALL DATA ON $DEV WILL BE DESTROYED."
+printf "Type the device name (%s) to confirm: " "$BASE"
+read -r CONFIRM
+[ "$CONFIRM" = "$BASE" ] || die "not confirmed"
+
+# ---------------------------------------------------------------- fetch
+if [ ! -f "$HERE/$TARBALL" ]; then
+	echo "==> downloading $TARBALL"
+	curl -fL -o "$HERE/$TARBALL" "$URL"
+fi
+
+# ---------------------------------------------------------------- partition
+echo "==> partitioning"
+umount "${DEV}"* 2>/dev/null || true
+wipefs -a "$DEV" >/dev/null
+sgdisk --zap-all "$DEV" >/dev/null 2>&1 || true
+sgdisk -n 1:0:0 -t 1:8300 -c 1:"$LABEL" "$DEV" >/dev/null
+partprobe "$DEV" 2>/dev/null || true
+sleep 2
+
+PART="${DEV}1"
+[ -b "$PART" ] || PART="${DEV}p1"
+[ -b "$PART" ] || die "cannot find the new partition on $DEV"
+
+echo "==> mkfs.ext4 $PART (label $LABEL)"
+# no metadata_csum_seed / no 64bit keeps it readable by older e2fsprogs on the TV
+mkfs.ext4 -q -F -L "$LABEL" -O ^64bit,^metadata_csum_seed "$PART"
+
+mount "$PART" "$MNT"
+trap 'umount "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null' EXIT
+
+# ---------------------------------------------------------------- unpack
+echo "==> unpacking Alpine"
+tar -xzf "$HERE/$TARBALL" -C "$MNT"
+mkdir -p "$MNT"/{proc,sys,dev,run,tmp,mnt,lib/firmware,root}
+chmod 1777 "$MNT/tmp"
+
+# ---------------------------------------------------------------- config
+cat > "$MNT/etc/inittab" <<'TAB'
+::sysinit:/sbin/rc-local
+ttyAMA0::respawn:/sbin/getty -n -l /bin/sh -L ttyAMA0 115200 vt100
+tty1::respawn:/sbin/getty -n -l /bin/sh 38400 tty1
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+TAB
+
+# busybox init runs this once at boot; keep it minimal and idempotent
+cat > "$MNT/sbin/rc-local" <<'RC'
+#!/bin/sh
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null
+mount -t tmpfs  tmpfs  /run     2>/dev/null
+mount -o remount,rw / 2>/dev/null
+hostname -F /etc/hostname 2>/dev/null
+
+ip link set lo up 2>/dev/null || ifconfig lo up
+if [ -e /sys/class/net/eth0 ]; then
+	ip link set eth0 up 2>/dev/null || ifconfig eth0 up
+	udhcpc -i eth0 -b -q >/dev/null 2>&1
+fi
+
+# This board has no RTC, so the clock starts at the epoch and anything
+# timestamp-sensitive (TLS, apk, make) misbehaves. Floor it at the rootfs
+# mtime, then correct over the network if ntpd is available.
+REF=$(date -r /etc/hostname '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+[ -n "$REF" ] && date -s "$REF" >/dev/null 2>&1
+command -v ntpd >/dev/null 2>&1 && ntpd -q -n -p pool.ntp.org >/dev/null 2>&1 &
+RC
+chmod +x "$MNT/sbin/rc-local"
+
+cat > "$MNT/etc/fstab" <<FSTAB
+LABEL=$LABEL  /         ext4   rw,relatime  0 1
+tmpfs         /tmp      tmpfs  rw,nosuid,nodev  0 0
+FSTAB
+
+echo lgtv > "$MNT/etc/hostname"
+echo "nameserver 1.1.1.1" > "$MNT/etc/resolv.conf"
+cat > "$MNT/etc/apk/repositories" <<REPO
+http://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
+http://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
+REPO
+
+mkdir -p "$MNT/usr/share/udhcpc"
+[ -f "$HERE/initramfs/usr/share/udhcpc/default.script" ] && \
+	install -m755 "$HERE/initramfs/usr/share/udhcpc/default.script" "$MNT/usr/share/udhcpc/"
+
+for t in fbtest ucom; do
+	[ -f "$HERE/$t" ] && install -m755 "$HERE/$t" "$MNT/usr/bin/" && echo "==> included $t"
+done
+[ -d "$HERE/initramfs/lib/firmware" ] && cp -a "$HERE/initramfs/lib/firmware/." "$MNT/lib/firmware/"
+
+sync
+echo
+echo "done. root partition: $PART  (LABEL=$LABEL)"
+echo "boot with:  root=LABEL=$LABEL"

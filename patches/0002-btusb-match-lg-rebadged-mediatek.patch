@@ -1,0 +1,21 @@
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/bluetooth/btusb.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/bluetooth/btusb.c
+index dbba6a09e..b4dee06e5 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/bluetooth/btusb.c
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/bluetooth/btusb.c
+@@ -377,6 +377,16 @@ static const struct usb_device_id blacklist_table[] = {
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(0x0e8d, 0xe0, 0x01, 0x01),
+ 	  .driver_info = BTUSB_MEDIATEK },
+ 
++	/* LG TVs carry a MediaTek combo chip behind LG's own USB vendor ID
++	 * (043e:3110 on the o22 board), so the 0x0e8d match above never fires.
++	 * The interface descriptor is the standard e0/01/01 HCI one and the chip
++	 * still self-identifies as 0x7663/0x7668 during setup, so matching on
++	 * LG's vendor ID is all that is needed. Stock webOS binds this device
++	 * with LG's out-of-tree btmtk_usb instead.
++	 */
++	{ USB_VENDOR_AND_INTERFACE_INFO(0x043e, 0xe0, 0x01, 0x01),
++	  .driver_info = BTUSB_MEDIATEK },
++
+ 	/* Additional Realtek 8723AE Bluetooth devices */
+ 	{ USB_DEVICE(0x0930, 0x021d), .driver_info = BTUSB_REALTEK },
+ 	{ USB_DEVICE(0x13d3, 0x3394), .driver_info = BTUSB_REALTEK },

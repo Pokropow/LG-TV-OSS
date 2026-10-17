@@ -1,0 +1,312 @@
+NOT WORKING -- parked for reference. Do not apply blindly.
+
+This patch is NOT part of the active set and is deliberately outside
+patches/*.patch so the "apply everything" loop in PATCHES.md skips it.
+
+It fixes four genuine defects in LG's ALSA playback path (details in the
+"Audio: where it stands" section of PATCHES.md):
+
+  1. trigger(START) announced an empty ring whenever it was exactly full
+     (the guard made appl_ptr % buffer_size necessarily 0).
+  2. A full ring is indistinguishable from an empty one -- both give
+     wrOffset == rdOffset. Holds back one frame when full.
+  3. ack() and trigger() sent IPC from atomic context (ALSA holds the PCM
+     stream lock with IRQs off); aimc_set_property does kmalloc(GFP_KERNEL)
+     and the send below it can block. Split compute from send, defer via
+     a workqueue.
+  4. _aplayback_updated() never updated the write pointer despite its own
+     comment saying it should. Now re-announces as the DSP drains.
+
+It also moves DSP module creation from open() to prepare(). That part did
+NOT help and can be dropped: the module's output thread logs
+"wrong read ptr 0x00000000" within 0.3ms of construction, before SET_BUFFER
+can be sent, and creation/SET_BUFFER are necessarily sequential.
+
+Each change is real and verifiably alters behaviour (wrOffset is computed
+and delivered correctly afterwards), but playback still produces no sound:
+the DSP playback module will not drain the ring. Keep this only as a
+starting point if someone returns to the ALSA path; the firmware loading
+(audfwload / load-audio-fw.sh) and patch 0006 are unaffected and DO work.
+
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
+index ef3aee29b..9de6c8ff6 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
+@@ -15,6 +15,7 @@
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/workqueue.h>
+ #include <asm/io.h>
+ #include <sound/soc.h>
+ 
+@@ -88,9 +89,18 @@ struct aplayback_priv
+ 
+     unsigned int wrOffset;
+     unsigned int rdOffset;
++
++    /* ALSA calls .ack and .trigger with the PCM stream lock held and IRQs
++     * disabled, but the IMC send path is not atomic-safe (aimc_set_property
++     * does kmalloc(GFP_KERNEL) and IMC_SendCommand below it can block), so
++     * the property never reaches the DSP from those callbacks. Defer it. */
++    struct work_struct wroffset_work;
+ };
+ 
+ static int aplayback_ack (struct snd_pcm_substream *substream);
++static void _aplayback_calc_wroffset (struct snd_pcm_substream *substream);
++static void _aplayback_send_wroffset (struct aplayback_priv *aplayback);
++static void _aplayback_wroffset_work (struct work_struct *work);
+ 
+ #define PERIOD_SIZE_MIN             (256 /*sample */  * 2 /*channel */  * 2 /*byte */)
+ #define PERIOD_SIZE_MAX             (256 /*sample */  * 2 /*channel */  * 4 /*byte */)
+@@ -147,6 +157,24 @@ static int _aplayback_updated (void *_param, int _paramLen, void *_cbParam)
+         trace ("rdOffset is 0x%08x\n", rdOffset);
+         aplayback->rdOffset = rdOffset;
+         snd_pcm_period_elapsed (aplayback->substream);
++
++        /* Re-announce the write pointer as the DSP drains -- this is what the
++         * comment above this function ("callback function to update wrPrt")
++         * always said it should do, but the body never did.
++         *
++         * The module advances roughly process-size (1024 B) per wrOffset
++         * update and does not self-clock between them, so without this the
++         * flow deadlocks: the application writes a few periods, each ack
++         * pokes the DSP once, the ring fills, the application blocks waiting
++         * for space, no further pokes arrive, the DSP stops draining and
++         * ALSA eventually declares an underrun. Pushing from here keeps the
++         * DSP consuming while the application is blocked, which in turn frees
++         * space and unblocks it.
++         *
++         * Order matters: period_elapsed() first, so hw_ptr reflects the new
++         * rdOffset and hw_avail is correct when the offset is recomputed. */
++        _aplayback_calc_wroffset (aplayback->substream);
++        _aplayback_send_wroffset (aplayback);
+     }
+ 
+     return 0;
+@@ -358,7 +386,6 @@ static int aplayback_open (struct snd_pcm_substream *substream)
+ {
+     struct snd_soc_pcm_runtime *soc_pcm_rtd = substream->pcm->private_data;
+     struct aplayback_priv *aplayback;
+-    int ret = RET_OK;
+ 
+     debug ("called\n");
+     info ("name %s\n", substream->name);
+@@ -376,6 +403,7 @@ static int aplayback_open (struct snd_pcm_substream *substream)
+ 
+     aplayback->is_connected = false;
+     aplayback->is_started = false;
++    INIT_WORK (&aplayback->wroffset_work, _aplayback_wroffset_work);
+ 
+     aplayback->substream = substream;
+ 
+@@ -391,14 +419,26 @@ static int aplayback_open (struct snd_pcm_substream *substream)
+     }
+ 
+ 
+-    ret = _aplayback_connect (aplayback);
+-    if (ret != RET_OK)
+-    {
+-        error ("Error in playback module create or connection.\n");
+-        kfree (aplayback);
+-        return -EIO;
+-    }
+-
++    /* DO NOT create the DSP module here.
++     *
++     * The module's output thread starts as soon as the module is created and
++     * immediately reads the ring address -- but the HMA ring is not allocated
++     * until hw_params() and its address is not sent until prepare(). So a
++     * module created at open() always starts against a null ring:
++     *
++     *   playback_XXXXXXXX ERR playback_output_thread_callback. 260: \
++     *       wrong read ptr 0x00000000
++     *
++     * That error appears exactly once per stream and the module then goes
++     * permanently silent -- even with log-mask set to 0xffffffff it never
++     * emits another line, which is a thread that exited rather than one that
++     * is starved. CAPTURE_CMD_RESET_BUFFER in prepare() does not revive it.
++     *
++     * So defer creation to prepare(), where the ring already exists and
++     * SET_BUFFER can be issued immediately afterwards. _aplayback_connect()
++     * sets is_connected, and prepare() may run more than once (xrun
++     * recovery), so the call there is guarded.
++     */
+     substream->runtime->private_data = aplayback;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
+@@ -430,6 +470,7 @@ static int aplayback_close (struct snd_pcm_substream *substream)
+     aimc_unregister_named_event (aplayback->event_id);
+     aimc_module_destroy (aplayback->uid_playback);
+ 
++    cancel_work_sync (&aplayback->wroffset_work);
+     kfree (aplayback);
+ 
+     noti ("free aplayback done.\n");
+@@ -500,6 +541,18 @@ static int aplayback_prepare (struct snd_pcm_substream *substream)
+     struct snd_pcm_runtime *runtime = substream->runtime;
+     CaptureCmdSetBuffer cmd = { };
+ 
++    /* Create the DSP module now, not at open(): by this point hw_params()
++     * has allocated the ring, so the module's output thread finds a valid
++     * read pointer the moment it starts. See the note in aplayback_open(). */
++    if (!aplayback->is_connected)
++    {
++        if (_aplayback_connect (aplayback) != RET_OK)
++        {
++            error ("Error in playback module create or connection.\n");
++            return -EIO;
++        }
++    }
++
+     //TODO: AUDIO_GetLgbusAddr??
+     cmd.buf_addr_p = aplayback->dma_addr;
+     cmd.buf_size = snd_pcm_lib_buffer_bytes (substream);
+@@ -515,6 +568,14 @@ static int aplayback_prepare (struct snd_pcm_substream *substream)
+     snd_pcm_period_elapsed (aplayback->substream);
+     aimc_send_command_sync (NULL, CAPTURE_CMD_RESET_BUFFER, 0, aplayback->uid_playback, NULL, 0);
+ 
++    /* CAPTURE_CMD_RESET_BUFFER does not clear the DSP's wrOffset. Its own
++     * property dump shows stale DSP heap data there (e.g. 0x6040f0a8), so the
++     * module treats the whole ring as valid, rdOffset races past appl_ptr and
++     * aplayback_pointer() reports an underrun -- EPIPE on the first write,
++     * before trigger(START) is ever reached. Initialise it explicitly. */
++    aplayback->wrOffset = 0;
++    aimc_set_property (aplayback->uid_playback, "wrOffset=%d", 0);
++
+     info ("reset buffer done.\n");
+ 
+     _aplayback_set_format (substream);
+@@ -522,6 +583,57 @@ static int aplayback_prepare (struct snd_pcm_substream *substream)
+     return 0;
+ }
+ 
++/*
++ * Compute the DSP write offset from appl_ptr and push it to the module.
++ *
++ * Valid data is (wrOffset - rdOffset) mod size, so a COMPLETELY FULL ring
++ * gives wrOffset == rdOffset -- which the DSP reads as EMPTY. Hold back a
++ * single frame in that case: the DSP then sees size - frame_bytes available,
++ * which is unambiguous and stays in range. Reporting size itself is not an
++ * option; an out-of-range offset makes the module emit silence. The withheld
++ * frame is announced by the next update.
++ *
++ * Both the ack path and trigger(START) must use this. LG's original START
++ * code computed appl_ptr %% buffer_size directly, which is exactly 0 when the
++ * application prefilled the whole ring (the normal case), so it announced
++ * "empty" at the very moment the ring was full.
++ */
++static void _aplayback_calc_wroffset (struct snd_pcm_substream *substream)
++{
++    struct snd_pcm_runtime *runtime = substream->runtime;
++    struct aplayback_priv *aplayback = runtime->private_data;
++    snd_pcm_sframes_t sw_ptr;
++
++    if (!aplayback)
++        return;
++
++    sw_ptr = runtime->control->appl_ptr % runtime->buffer_size;
++    aplayback->wrOffset = frames_to_bytes (runtime, sw_ptr);
++
++    if (snd_pcm_playback_hw_avail (runtime) >= (snd_pcm_sframes_t) runtime->buffer_size)
++    {
++        unsigned int buf_bytes = frames_to_bytes (runtime, runtime->buffer_size);
++        unsigned int frame_bytes = frames_to_bytes (runtime, 1);
++
++        aplayback->wrOffset = (aplayback->wrOffset + buf_bytes - frame_bytes) % buf_bytes;
++    }
++
++}
++
++/* Perform the actual IPC. Process context only. */
++static void _aplayback_send_wroffset (struct aplayback_priv *aplayback)
++{
++    aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
++}
++
++static void _aplayback_wroffset_work (struct work_struct *work)
++{
++    struct aplayback_priv *aplayback =
++        container_of (work, struct aplayback_priv, wroffset_work);
++
++    _aplayback_send_wroffset (aplayback);
++}
++
+ static int aplayback_trigger (struct snd_pcm_substream *substream, int cmd)
+ {
+     struct aplayback_priv *aplayback = substream->runtime->private_data;
+@@ -535,14 +647,12 @@ static int aplayback_trigger (struct snd_pcm_substream *substream, int cmd)
+ 
+         case SNDRV_PCM_TRIGGER_START:
+             info ("start\n");
+-            // if pcm data exists
+-            if (substream->runtime->control->appl_ptr == substream->runtime->buffer_size)
+-            {
+-                snd_pcm_sframes_t sw_ptr =
+-                    substream->runtime->control->appl_ptr % substream->runtime->buffer_size;
+-                aplayback->wrOffset = frames_to_bytes (substream->runtime, sw_ptr);
+-                aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
+-            }
++            /* Announce whatever the application prefilled. Must go through the
++             * helper: the original code pushed appl_ptr %% buffer_size, which
++             * is 0 for a fully prefilled ring and clobbered the correct value
++             * the ack path had already sent. */
++            _aplayback_calc_wroffset (substream);
++            schedule_work (&aplayback->wroffset_work);
+             aplayback->is_started = true;
+             break;
+ 
+@@ -589,6 +699,7 @@ static int aplayback_hw_params (struct snd_pcm_substream *substream,
+     if (!aplayback->dma_addr)
+     {
+         error ("no mem for dma\n");
++        cancel_work_sync (&aplayback->wroffset_work);
+         kfree (aplayback);
+         return -ENOMEM;
+     }
+@@ -597,6 +708,7 @@ static int aplayback_hw_params (struct snd_pcm_substream *substream,
+     {
+         error ("cannot map dma buffer\n");
+         hma_free (aplayback_poolname, aplayback->dma_addr);
++        cancel_work_sync (&aplayback->wroffset_work);
+         kfree (aplayback);
+         return -EIO;
+     }
+@@ -631,6 +743,10 @@ static int aplayback_hw_free (struct snd_pcm_substream *substream)
+ 
+     debug ("called. vaddr %p\n", aplayback->dma_vaddr);
+ 
++    /* Destroy the module before the ring goes away, so it can never hold a
++     * freed address and the next prepare() builds it against a fresh one. */
++    _aplayback_disconnect (aplayback);
++
+     snd_pcm_set_runtime_buffer (substream, NULL);
+ 
+     hma_unmap (aplayback->dma_vaddr);
+@@ -689,15 +805,20 @@ static int aplayback_ack (struct snd_pcm_substream *substream)
+     debug ("called runtime->control->appl_ptr:%lu buffer_size:%lu\n", runtime->control->appl_ptr,
+         runtime->buffer_size);
+ 
+-    if (aplayback->is_started)
++    /* No is_started gate: ALSA prefills the ring BEFORE trigger(START)
++     * sets it, so gating here left the DSP unaware of the prefilled data. */
+     {
++        _aplayback_calc_wroffset (substream);
++        schedule_work (&aplayback->wroffset_work);
++
+         sw_ptr = runtime->control->appl_ptr % runtime->buffer_size;
+-        aplayback->wrOffset = frames_to_bytes (substream->runtime, sw_ptr);
+-        debug ("(device:%d) wrOffset 0x%05x sw_ptr %4ld buffer_size %ld rdOffset 0x%05x\n",
+-            soc_pcm_rtd->cpu_dai->id, aplayback->wrOffset, sw_ptr, runtime->buffer_size,
+-            aplayback->rdOffset);
+ 
+-        aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
++        /* noti() not debug(): we need to see that ack fires and with what
++         * value. The DSP's own wrOffset property READ returns stale heap
++         * data, so the kernel-side numbers are the only trustworthy ones. */
++        noti ("(device:%d) wrOffset 0x%05x sw_ptr %4ld buffer_size %ld rdOffset 0x%05x hw_avail %ld\n",
++            soc_pcm_rtd->cpu_dai->id, aplayback->wrOffset, sw_ptr, runtime->buffer_size,
++            aplayback->rdOffset, snd_pcm_playback_hw_avail (runtime));
+     }
+ 
+     return 0;

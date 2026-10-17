@@ -1,0 +1,21 @@
+#!/bin/sh
+# Convenience launcher:
+#   startcage              -- a terminal
+#   startcage <cmd> [args] -- run something else fullscreen
+# Run as the session user, not root. Firefox, Chromium and VLC refuse to
+# start as uid 0, so a root desktop is a dead end. Re-exec via su when
+# invoked from the root console, which is the normal case here.
+SESSION_USER="${SESSION_USER:-tv}"
+if [ "$(id -u)" = 0 ] && [ "$SESSION_USER" != root ] && id "$SESSION_USER" >/dev/null 2>&1; then
+	# su -c takes a single string, so re-quote each argument or anything
+	# containing a space (a font spec, say) is split apart.
+	_q=""
+	for _a in "$@"; do
+		_q="$_q '$(printf '%s' "$_a" | sed "s/'/'\\\\''/g")'"
+	done
+	exec su -l "$SESSION_USER" -c "exec $0$_q"
+fi
+
+. /etc/profile.d/wayland.sh
+[ $# -eq 0 ] && exec cage -- foot -f "monospace:size=28"
+exec cage -- "$@"

@@ -1,0 +1,156 @@
+#!/bin/sh
+# magic-remote -- bring up the LG Magic Remote and start the input daemon.
+#
+# The remote is BLE HID, but its report descriptor has no usages, so the
+# kernel creates only a hidraw node and no evdev device. magicremote(1)
+# decodes the reports and injects them via uinput; this script does the
+# Bluetooth half: find the remote, connect it, wait for its hidraw node to
+# appear, then hand over.
+#
+#   magic-remote                 discover, pair if needed, connect, run daemon
+#   MAC=68:96:6A:.. magic-remote skip discovery
+#   magic-remote --connect-only  do not start the daemon
+#   magic-remote --repair        forget the bond and pair again
+#
+# Pairing is driven through bluetoothctl's own agent. The awkward part is
+# that the agent only lives as long as bluetoothctl's stdin stays open, so
+# the command stream below is paced with sleeps rather than piped in one go
+# -- close stdin early and the agent deregisters mid-negotiation and pairing
+# fails with "Authentication Failed".
+#
+# The remote is BLE "Just Works" (no PIN), so NoInputNoOutput is the right
+# capability and no user interaction is needed -- provided the remote is
+# advertising. If it is already bonded to this TV from webOS but BlueZ has
+# no matching key (a fresh rootfs, say), it will send a Security Request for
+# a bond we do not have and pairing fails; putting the remote into pairing
+# mode clears its side. Hold Back + Home for about five seconds.
+set -u
+
+MAC="${MAC:-}"
+NAME_MATCH="${NAME_MATCH:-MR2}"     # MR21N / MR22N / MR23...
+SCAN_SECS="${SCAN_SECS:-15}"
+RETRIES="${RETRIES:-10}"
+DAEMON="${DAEMON:-magicremote}"
+connect_only=0
+repair=0
+
+for a in "$@"; do
+	case "$a" in
+	--connect-only) connect_only=1 ;;
+	--repair)       repair=1 ;;
+	*) echo "unknown option: $a" >&2; exit 2 ;;
+	esac
+done
+
+log() { echo "magic-remote: $*" >&2; }
+
+command -v bluetoothctl >/dev/null 2>&1 || { log "bluetoothctl not found (apk add bluez)"; exit 1; }
+
+# The adapter may not be up yet if we run early at boot.
+i=0
+while [ $i -lt 10 ]; do
+	bluetoothctl list 2>/dev/null | grep -q Controller && break
+	sleep 1
+	i=$((i + 1))
+done
+bluetoothctl list 2>/dev/null | grep -q Controller || { log "no bluetooth adapter"; exit 1; }
+
+bluetoothctl power on >/dev/null 2>&1
+
+find_mac() {
+	bluetoothctl devices 2>/dev/null \
+		| grep -i "$NAME_MATCH" | head -1 | cut -d' ' -f2
+}
+
+if [ -z "$MAC" ]; then
+	MAC="$(find_mac)"
+fi
+if [ -z "$MAC" ]; then
+	log "not in known devices, scanning for ${SCAN_SECS}s"
+	bluetoothctl --timeout "$SCAN_SECS" scan on >/dev/null 2>&1
+	MAC="$(find_mac)"
+fi
+[ -n "$MAC" ] || { log "no device matching '$NAME_MATCH' found"; exit 1; }
+log "remote is $MAC"
+
+pair_device() {
+	log "pairing $MAC"
+	# Paced deliberately: bluetoothctl's agent is only registered while its
+	# stdin is open, so the sleeps are what keep it alive long enough to
+	# answer the pairing negotiation.
+	{
+		echo "agent NoInputNoOutput"
+		sleep 1
+		echo "default-agent"
+		sleep 1
+		echo "scan on"
+		sleep "$SCAN_SECS"
+		echo "pair $MAC"
+		sleep 15
+		echo "trust $MAC"
+		sleep 2
+		echo "scan off"
+		sleep 1
+		echo "quit"
+	} | bluetoothctl >/dev/null 2>&1
+}
+
+is_paired() { bluetoothctl info "$MAC" 2>/dev/null | grep -q 'Paired: yes'; }
+
+if [ "$repair" = 1 ]; then
+	log "forgetting existing bond"
+	bluetoothctl remove "$MAC" >/dev/null 2>&1
+fi
+
+if ! is_paired; then
+	pair_device
+	if ! is_paired; then
+		log "pairing failed -- put the remote into pairing mode and retry"
+		log "  (hold Back + Home for about five seconds, LED blinks)"
+		pair_device
+	fi
+fi
+
+is_paired || { log "still not paired, giving up"; exit 1; }
+log "paired"
+
+# Trusted devices are reconnected by bluetoothd on their own; harmless to
+# repeat and it is what makes the remote come back after a power cycle.
+bluetoothctl trust "$MAC" >/dev/null 2>&1
+
+i=0
+while [ $i -lt "$RETRIES" ]; do
+	if bluetoothctl info "$MAC" 2>/dev/null | grep -q 'Connected: yes'; then
+		break
+	fi
+	bluetoothctl connect "$MAC" >/dev/null 2>&1
+	sleep 2
+	i=$((i + 1))
+done
+
+bluetoothctl info "$MAC" 2>/dev/null | grep -q 'Connected: yes' \
+	|| { log "could not connect after $RETRIES attempts"; exit 1; }
+log "connected"
+
+# The hidraw node appears a moment after the HoG profile attaches.
+DEV=""
+i=0
+while [ $i -lt 20 ] && [ -z "$DEV" ]; do
+	for h in /sys/class/hidraw/hidraw*; do
+		[ -e "$h/device/uevent" ] || continue
+		if grep -qi "HID_NAME=.*$NAME_MATCH" "$h/device/uevent" 2>/dev/null; then
+			DEV="/dev/$(basename "$h")"
+			break
+		fi
+	done
+	[ -z "$DEV" ] && sleep 1
+	i=$((i + 1))
+done
+[ -n "$DEV" ] || { log "connected but no hidraw node appeared"; exit 1; }
+log "hidraw node is $DEV"
+
+[ "$connect_only" = 1 ] && exit 0
+
+command -v "$DAEMON" >/dev/null 2>&1 || { log "$DAEMON not found in PATH"; exit 1; }
+log "starting $DAEMON"
+exec "$DAEMON" "$DEV"

@@ -1,0 +1,39 @@
+#!/bin/sh
+# busybox udhcpc hands the lease to this script; without it udhcpc negotiates
+# an address and then does nothing with it. This is the default path udhcpc
+# looks for, so plain "udhcpc -i eth0" picks it up with no -s needed.
+
+[ -z "$1" ] && echo "default.script: must be called from udhcpc" && exit 1
+
+RESOLV_CONF=/etc/resolv.conf
+
+[ -n "$broadcast" ] && BROADCAST="broadcast $broadcast"
+[ -n "$subnet" ]    && NETMASK="netmask $subnet"
+
+case "$1" in
+	deconfig)
+		ifconfig "$interface" 0.0.0.0
+		;;
+
+	renew|bound)
+		ifconfig "$interface" "$ip" $BROADCAST $NETMASK
+
+		if [ -n "$router" ]; then
+			# drop any stale defaults first, or they shadow the new one
+			while route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do
+				:
+			done
+			for i in $router; do
+				route add default gw "$i" dev "$interface"
+			done
+		fi
+
+		: > "$RESOLV_CONF"
+		[ -n "$domain" ] && echo "search $domain" >> "$RESOLV_CONF"
+		for i in $dns; do
+			echo "nameserver $i" >> "$RESOLV_CONF"
+		done
+		;;
+esac
+
+exit 0

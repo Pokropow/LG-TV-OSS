@@ -1,0 +1,205 @@
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/Makefile b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/Makefile
+index fed8a0802..8f89d7027 100644
+--- a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/Makefile
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/Makefile
+@@ -3,6 +3,6 @@ obj-$(CONFIG_ETHERNET)		+= eth.o
+ obj-$(CONFIG_USB)		+= usb.o
+ obj-$(CONFIG_AMBA_PL08X)	+= dmac.o
+ obj-$(CONFIG_LG_SNAPSHOT_BOOT)		+= snap.o
+-obj-y	+= mach.o ksyms.o
++obj-y	+= mach.o ksyms.o micom_pet.o
+ obj-$(CONFIG_PM)		+= pm.o
+ obj-$(CONFIG_CMA)		+= cma.o
+diff --git a/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/micom_pet.c b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/micom_pet.c
+new file mode 100644
+index 000000000..fe4bf7731
+--- /dev/null
++++ b/linux-and-kdriver_okapi-3/linux-rockhopper/drivers/soc/lg1k/micom_pet.c
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * micom_pet - keep the LG1213 (o22) MICOM host-liveness watchdog fed.
++ *
++ * The MICOM is a separate always-on microcontroller that resets the SoC
++ * about 22 seconds after the main CPU stops talking to it. On a stock boot
++ * /usr/sbin/micomservice does this via the ucom kdriver; on a kexec'd or
++ * custom kernel nothing does, and the machine is reset mid-boot with no
++ * panic and nothing written to the dump partition.
++ *
++ * Protocol reimplemented from kdriver/chip/o22/ucom/ucom_o22_func.c. Stock
++ * sends exactly one message in steady state -- a 3-byte read of command
++ * 0xC0, at 25Hz -- and that is all the MICOM needs to see.
++ *
++ * This runs from early_initcall, long before any device driver can wedge
++ * the boot, so a kernel that hangs later stays hung and debuggable instead
++ * of being reset out from under you.
++ *
++ * Off by default: petting keeps the machine alive, which is exactly what you
++ * do NOT want when you are trying to observe a fault, power the panel down,
++ * or hand control back to something else that talks to the micom. Opt in.
++ *
++ * Cmdline: micom_pet=on       enable at the default 200ms interval
++ *          micom_pet          same, bare form
++ *          micom_pet=<ms>     enable, with an explicit interval
++ *          micom_pet=off      explicitly disabled (also the default)
++ */
++
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/timer.h>
++
++#define MICOM_BASE	0xF0004000UL	/* one page covers every window below */
++#define MICOM_SIZE	0x1000
++
++#define OFF_M2A_IPC	0x100		/* micom -> ARM mailbox  */
++#define OFF_M2A_IRQ	0x180		/* micom -> ARM doorbell */
++#define OFF_A2M_IPC	0x200		/* ARM -> micom mailbox  */
++#define OFF_A2M_IRQ	0x280		/* ARM -> micom doorbell */
++
++#define REG(n)		((n) << 2)
++
++#define M2A_IPC_DONE	0x1
++#define UCOM_RX		4
++#define MICOM_CMD_PET	0xC0		/* unnamed in every LG command table */
++#define PET_LEN		3
++
++/* The micom tolerates ~22s of silence, so even a very slow tick has a
++ * huge margin. 200ms is ~110x faster than required and costs nothing. */
++#define PET_INTERVAL_DEFAULT_MS	200
++
++/* How often to print a progress line. Quiet by default so a boot log stays
++ * readable; pass micom_pet_report=<ms> to turn it up when debugging a reset,
++ * where a rate slower than a second or two tells you nothing about whether
++ * petting survived to the moment it happened. */
++#define PET_REPORT_MS		60000
++
++static void __iomem *micom_base;
++static struct timer_list pet_timer;
++static unsigned int pet_interval_ms = PET_INTERVAL_DEFAULT_MS;
++static unsigned int pet_report_ms = PET_REPORT_MS;
++/* Opt-in: without micom_pet=on (or an interval) the micom is never fed and
++ * the SoC is reset ~22s after boot. */
++static bool pet_enabled;
++
++static u16 pet_keyctr;
++static u32 pet_last_key;
++static unsigned long pet_sent, pet_ok, pet_badkey, pet_nodone;
++static unsigned long pet_last_jiffies;
++
++static int __init micom_pet_report_param(char *str)
++{
++	unsigned int ms;
++
++	if (str && !kstrtouint(str, 0, &ms) && ms >= 1 && ms <= 60000)
++		pet_report_ms = ms;
++
++	return 0;
++}
++early_param("micom_pet_report", micom_pet_report_param);
++
++static int __init micom_pet_param(char *str)
++{
++	unsigned int ms;
++
++	/* bare "micom_pet" with no value arrives here as NULL */
++	if (!str || !strcmp(str, "on")) {
++		pet_enabled = true;
++		return 0;
++	}
++	if (!strcmp(str, "off")) {
++		pet_enabled = false;
++		return 0;
++	}
++	/* an explicit interval implies enable */
++	if (!kstrtouint(str, 0, &ms) && ms >= 1 && ms <= 10000) {
++		pet_interval_ms = ms;
++		pet_enabled = true;
++	}
++
++	return 0;
++}
++early_param("micom_pet", micom_pet_param);
++
++static void micom_pet_fn(struct timer_list *unused)
++{
++	u32 word0;
++
++	/*
++	 * Verify the *previous* request instead of busy-waiting on this one.
++	 * The micom has had a full interval to answer by now, so we get
++	 * confirmation for free and never spin in softirq context -- the
++	 * kdriver's 12ms preempt-disabled poll would be unacceptable here.
++	 */
++	if (pet_sent) {
++		if (readl(micom_base + OFF_M2A_IRQ) & M2A_IPC_DONE) {
++			if (readl(micom_base + OFF_M2A_IPC + REG(1)) == pet_last_key)
++				pet_ok++;
++			else
++				pet_badkey++;
++		} else {
++			pet_nodone++;
++		}
++	}
++
++	/* consume any pending DONE so the next check is unambiguous */
++	writel(0, micom_base + OFF_M2A_IRQ);
++
++	/* word0 = len | dir<<8; word2 low byte = command */
++	word0 = (PET_LEN & 0xff) | (UCOM_RX << 8);
++	pet_last_key = 0xface0000u | pet_keyctr++;
++
++	writel(word0,         micom_base + OFF_A2M_IPC + REG(0));
++	writel(pet_last_key,  micom_base + OFF_A2M_IPC + REG(1));
++	writel(MICOM_CMD_PET, micom_base + OFF_A2M_IPC + REG(2));
++
++	/* ring the micom's doorbell */
++	writel(0x1, micom_base + OFF_A2M_IRQ);
++	pet_sent++;
++
++	/* If we were starved for much longer than our own period, something
++	 * held off timer softirqs -- say so, because a silent gap in this
++	 * log otherwise looks identical to the timer having died. */
++	if (pet_last_jiffies) {
++		unsigned int late_ms =
++			jiffies_to_msecs(jiffies - pet_last_jiffies);
++
++		if (late_ms > 3 * pet_interval_ms)
++			pr_warn("micom_pet: STALL %ums between pets (expected %ums) at sent=%lu\n",
++				late_ms, pet_interval_ms, pet_sent);
++	}
++	pet_last_jiffies = jiffies;
++
++	if (pet_sent <= 3 ||
++	    !(pet_sent % max(1U, pet_report_ms / pet_interval_ms)))
++		pr_info("micom_pet: sent=%lu ok=%lu badkey=%lu nodone=%lu\n",
++			pet_sent, pet_ok, pet_badkey, pet_nodone);
++
++	mod_timer(&pet_timer, jiffies + msecs_to_jiffies(pet_interval_ms));
++}
++
++static int __init micom_pet_init(void)
++{
++	if (!pet_enabled) {
++		pr_info("micom_pet: disabled (pass micom_pet=on to feed the micom; "
++			"without it the SoC resets ~22s after boot)\n");
++		return 0;
++	}
++
++	micom_base = ioremap(MICOM_BASE, MICOM_SIZE);
++	if (!micom_base) {
++		pr_err("micom_pet: ioremap(%#lx) failed, watchdog will fire\n",
++		       MICOM_BASE);
++		return -ENOMEM;
++	}
++
++	timer_setup(&pet_timer, micom_pet_fn, 0);
++	pr_info("micom_pet: feeding micom cmd %#x every %ums\n",
++		MICOM_CMD_PET, pet_interval_ms);
++
++	/* pet immediately rather than waiting out the first interval */
++	micom_pet_fn(&pet_timer);
++
++	return 0;
++}
++early_initcall(micom_pet_init);

@@ -1,0 +1,4 @@
+alpine/alpine-rootfs
+# Per-unit values: MAC address, serial number, sbkey, AVS calibration.
+# Copy tv-env.example.sh to tv-env.sh and fill in from your own set.
+tv-env.sh

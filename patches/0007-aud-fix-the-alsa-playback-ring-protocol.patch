@@ -1,0 +1,202 @@
+aud: fix the ALSA playback ring protocol
+
+Three defects kept the DSP-side `playback` module and the ALSA ring out of
+sync, so every stream either failed with EPIPE or delivered nothing. Traced on
+an LG OLED65C21LA (o22) by logging the kernel's aplayback_ack against the
+module's own process_buf on one timeline.
+
+1. The module was never started or stopped.
+
+   It starts its own output thread as soon as aimc_module_create() returns and
+   is never told to stop; alsa_playback.c's trigger only set a local
+   `is_started` flag and sent no IPC at all.
+
+     KRN ack: wrOffset 0x01ffc sw_ptr 0 ... rdOffset 0x00400 hw_avail 2048
+     KRN aplayback_trigger 649: start     <- ALSA starts once the ring is FULL
+     ... but DSP process_buf had been draining that ring the whole time ...
+
+     KRN aplayback_trigger 644: stop
+     KRN aplayback_hw_free 754: hma free done  <- ring returned to the HMA pool
+     DSP process_buf: wr 0x01ffc rd 0x01c00    <- still reading it, 100 ms later
+
+   So it consumed the buffer while userspace was still prefilling -- the
+   hardware pointer ran past the application pointer and the first write
+   failed with EPIPE -- and it kept reading the DMA buffer after hw_free()
+   released it. It also explains the "playback_output_thread_callback: wrong
+   read ptr 0x00000000" logged at construction, before any
+   CAPTURE_CMD_SET_BUFFER can have arrived.
+
+   alsa_capture.c:795 and lgsic_mc.c:437 drive the same CAPTURE_CMD_SET_BUFFER
+   / CAPTURE_CMD_RESET_BUFFER protocol and both send ADEC_CMD_START/STOP from
+   their trigger. alsa_playback.c was the only one that did not. ADEC_CMD_START
+   and ADEC_CMD_STOP come from imc/adec_imc_cmd.h, already in scope via
+   imc/cmd/module_cmd_capture.h.
+
+2. The write pointer was never announced.
+
+     KRN aplayback_ack 701: called ... appl_ptr:512  buffer_size:2048
+     KRN aplayback_ack 701: called ... appl_ptr:1024 buffer_size:2048
+     KRN aplayback_ack 701: called ... appl_ptr:1536 buffer_size:2048
+     KRN aplayback_ack 701: called ... appl_ptr:2048 buffer_size:2048
+     KRN aplayback_trigger 549: start        <- is_started set only HERE
+     DSP process_buf: wr 0x00000(0) rd 0x00400(1024)  <- and in all 24 others
+
+   aplayback_ack announced wrOffset only `if (aplayback->is_started)`, but ALSA
+   prefills the entire buffer before it issues TRIGGER_START. Every prefill ack
+   was gated off and nothing was ever sent, leaving the module at wr == 0.
+
+3. A full ring was indistinguishable from an empty one.
+
+   At TRIGGER_START the open-coded `appl_ptr % buffer_size` aliases a
+   completely full ring onto 0 -- the same value that means empty. The module
+   read (0 - rdOffset) mod size as the available byte count and burst-drained
+   seven 1024-byte chunks in ~1 ms (log timestamps 150 us apart) instead of
+   pacing them over 37 ms. That laps the application pointer, so the first
+   write returns EPIPE.
+
+Both pointer paths now go through one helper, which announces on every ack
+and, when the ring is exactly full, holds back one PERIOD so the value cannot
+alias. A period is a whole number of the module's 1024-byte process_buf chunk.
+An earlier attempt (patches/not-working/) held back a single FRAME, 4 bytes,
+which broke that alignment: the module read a full 1024-byte chunk when only
+1020 bytes were available, rdOffset overshot wrOffset by 4, and the modular
+arithmetic flipped to ~8188 bytes available -- the same runaway by a different
+route. Values observed then were wr 8188, 1020, 3068, always 4 short of a
+chunk boundary.
+
+The kaimc.c hunk is a consequence of fix 2. aimc_set_property() allocates with
+GFP_KERNEL, and announcing from every ack means calling it from atomic context:
+ALSA invokes ops->ack() with the PCM stream lock held and interrupts disabled
+(sound/core/pcm_lib.c:2092). LG's original code had the same defect behind the
+is_started gate; removing the gate makes it fire on every ack, so the
+allocation becomes GFP_ATOMIC. It is small and freed before the function
+returns.
+
+Verified on an LG OLED65C21LA: speaker-test runs with zero EPIPE at the
+default buffer size, and rdOffset advances at real time.
+
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
+index ef3aee29b..3d4834374 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_playback.c
+@@ -522,6 +522,40 @@ static int aplayback_prepare (struct snd_pcm_substream *substream)
+     return 0;
+ }
+ 
++/**
++ * Announce the write pointer to the DSP playback module.
++ *
++ * Two things this gets right that the open-coded versions did not:
++ *
++ * 1. It is called for EVERY ack, not only once the stream is started. ALSA
++ *    prefills the whole buffer before it issues TRIGGER_START, so gating on
++ *    is_started meant the entire prefill was never announced and the module
++ *    sat at wr == 0 for the life of the stream.
++ *
++ * 2. When the ring is exactly full, appl_ptr % buffer_size aliases onto 0 --
++ *    the same value that means "empty". Traced: the module then computed
++ *    (0 - rdOffset) mod size as the available byte count and burst-drained
++ *    seven 1024-byte chunks in ~1 ms instead of pacing them over 37 ms, which
++ *    laps the application pointer and raises XRUN. So in that case hold back
++ *    one PERIOD. A period is a whole number of the module's 1024-byte
++ *    process_buf chunks; an earlier attempt held back a single frame (4 bytes)
++ *    and broke that alignment, leaving the module reading 1024 bytes when only
++ *    1020 were available.
++ */
++static void _aplayback_announce_wroffset (struct snd_pcm_substream *substream)
++{
++    struct snd_pcm_runtime *runtime = substream->runtime;
++    struct aplayback_priv *aplayback = runtime->private_data;
++    snd_pcm_uframes_t frames = runtime->control->appl_ptr;
++
++    if (snd_pcm_playback_hw_avail (runtime) >= (snd_pcm_sframes_t) runtime->buffer_size)
++        frames -= runtime->period_size;
++
++    aplayback->wrOffset = frames_to_bytes (runtime, frames % runtime->buffer_size);
++
++    aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
++}
++
+ static int aplayback_trigger (struct snd_pcm_substream *substream, int cmd)
+ {
+     struct aplayback_priv *aplayback = substream->runtime->private_data;
+@@ -529,20 +563,27 @@ static int aplayback_trigger (struct snd_pcm_substream *substream, int cmd)
+     switch (cmd)
+     {
+         case SNDRV_PCM_TRIGGER_STOP:
++            /* The DSP playback module runs its own output thread from the
++             * moment aimc_module_create() returns, and nothing here ever told
++             * it to stop. Traced: process_buf kept reading the ring 100 ms
++             * after aplayback_hw_free() had returned it to the HMA pool.
++             * alsa_capture.c:795 and lgsic_mc.c:437 -- same CAPTURE_CMD_*
++             * protocol -- both send this; only playback did not. */
++            aimc_send_command (NULL, ADEC_CMD_STOP, 0, aplayback->uid_playback, NULL, 0);
+             info ("stop\n");
+             aplayback->is_started = false;
+             break;
+ 
+         case SNDRV_PCM_TRIGGER_START:
++            /* Without this the module drains the ring while userspace is
++             * still prefilling it, so by the time ALSA reaches START the
++             * hardware pointer has already run away and the first write
++             * fails with EPIPE (XRUN). */
++            aimc_send_command (NULL, ADEC_CMD_START, 0, aplayback->uid_playback, NULL, 0);
+             info ("start\n");
+-            // if pcm data exists
+-            if (substream->runtime->control->appl_ptr == substream->runtime->buffer_size)
+-            {
+-                snd_pcm_sframes_t sw_ptr =
+-                    substream->runtime->control->appl_ptr % substream->runtime->buffer_size;
+-                aplayback->wrOffset = frames_to_bytes (substream->runtime, sw_ptr);
+-                aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
+-            }
++            /* Re-announce: the prefill is already in the ring and the module
++             * must be told how much, with the full-ring case disambiguated. */
++            _aplayback_announce_wroffset (substream);
+             aplayback->is_started = true;
+             break;
+ 
+@@ -689,16 +730,12 @@ static int aplayback_ack (struct snd_pcm_substream *substream)
+     debug ("called runtime->control->appl_ptr:%lu buffer_size:%lu\n", runtime->control->appl_ptr,
+         runtime->buffer_size);
+ 
+-    if (aplayback->is_started)
+-    {
+-        sw_ptr = runtime->control->appl_ptr % runtime->buffer_size;
+-        aplayback->wrOffset = frames_to_bytes (substream->runtime, sw_ptr);
+-        debug ("(device:%d) wrOffset 0x%05x sw_ptr %4ld buffer_size %ld rdOffset 0x%05x\n",
+-            soc_pcm_rtd->cpu_dai->id, aplayback->wrOffset, sw_ptr, runtime->buffer_size,
+-            aplayback->rdOffset);
++    _aplayback_announce_wroffset (substream);
+ 
+-        aimc_set_property (aplayback->uid_playback, "wrOffset=%d", aplayback->wrOffset);
+-    }
++    sw_ptr = runtime->control->appl_ptr % runtime->buffer_size;
++    debug ("(device:%d) wrOffset 0x%05x sw_ptr %4ld buffer_size %ld rdOffset 0x%05x hw_avail %ld\n",
++        soc_pcm_rtd->cpu_dai->id, aplayback->wrOffset, sw_ptr, runtime->buffer_size,
++        aplayback->rdOffset, snd_pcm_playback_hw_avail (runtime));
+ 
+     return 0;
+ }
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/aud/kaimc.c b/linux-and-kdriver_okapi-3/kdriver/core/aud/kaimc.c
+index b26f2f1e7..39f5bb464 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/aud/kaimc.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/aud/kaimc.c
+@@ -1300,7 +1300,16 @@ int aimc_set_property (unsigned int target, char *prop_fmt, ...)
+     len = vsnprintf (NULL, 0, prop_fmt, ap);
+     va_end (ap);
+ 
+-    param = kmalloc (sizeof (*param) + len + 1, GFP_KERNEL);
++    /* GFP_ATOMIC, not GFP_KERNEL: this is reachable from atomic context.
++     * alsa_playback.c's aplayback_ack() announces wrOffset from here, and
++     * ALSA calls ops->ack() with the PCM stream lock held and interrupts
++     * disabled (sound/core/pcm_lib.c:2092, from __snd_pcm_lib_xfer). A
++     * GFP_KERNEL allocation there may sleep, which is a bug even though the
++     * fast path almost always succeeds without sleeping -- CONFIG_DEBUG_
++     * ATOMIC_SLEEP flags it, and under memory pressure it would really sleep
++     * with interrupts off. The allocation is small and is freed before this
++     * function returns, so drawing on the atomic reserves is cheap. */
++    param = kmalloc (sizeof (*param) + len + 1, GFP_ATOMIC);
+     if (!param)
+     {
+         error ("no mem. %s\n", prop_fmt);

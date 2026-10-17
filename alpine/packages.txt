@@ -1,0 +1,78 @@
+# Packages installed on the TV on first boot, by prepare-alpine-usb.sh.
+# Copied to /etc/lgtv-packages on the stick; rc-local runs `apk add` on them.
+# Blank lines and # comments are ignored. Compare against the live system with
+#   cat /etc/apk/world
+
+# --- bluetooth --------------------------------------------------------
+# The LG Magic Remote is a BLE HID device: paired, it appears to kwin as an
+# ordinary mouse (the wand pointer) and keyboard via uhid. Needs the kernel's
+# btusb+MTK support and the MediaTek BT patch firmware, which lives on the
+# stock eMMC rootfs rather than being copied here.
+bluez
+
+# --- remote access ----------------------------------------------------
+# telnetd, for working on the TV with no serial console. Alpine's base busybox
+# applet set does NOT include telnetd -- it is split out into busybox-extras,
+# which also carries ftpd/httpd. See the rc-local block that starts it.
+busybox-extras
+
+# --- session plumbing -------------------------------------------------
+# eudev: libinput only accepts input devices tagged ID_INPUT=1 by udev's
+# input_id builtin. With no udevd the compositor sees no keyboard at all.
+eudev
+# seatd: brokers DRM/input access via libseat. NOT elogind -- see the note at
+# the top of prepare-alpine-usb.sh for why that was reverted.
+seatd
+# dbus: Plasma will not start without a system bus; nothing else provides one.
+dbus
+dbus-x11
+
+# --- GPU / rendering --------------------------------------------------
+# panfrost lives in mesa-dri-gallium.
+mesa-dri-gallium
+mesa-egl
+mesa-gles
+mesa-gbm
+mesa-demos
+
+# --- compositor + terminal --------------------------------------------
+cage
+foot
+xwayland
+
+# --- fonts and input --------------------------------------------------
+# Without a font foot exits with "failed to load primary fonts"; without
+# xkeyboard-config keypresses produce no usable keysyms.
+font-dejavu
+xkeyboard-config
+libinput
+
+# --- Plasma Bigscreen -------------------------------------------------
+plasma-bigscreen
+plasma-workspace
+# QML modules Bigscreen imports unconditionally.
+plasma5support
+powerdevil
+plasma-nm
+plasma-pa
+kdeplasma-addons
+kde-cli-tools
+
+# --- on-screen keyboard -----------------------------------------------
+# Plasma Bigscreen's OSK only appears if kwin has an input method configured
+# to launch (kwinrc [Wayland] InputMethod=...). Without that, focusing a text
+# field does nothing and logs nothing. webOS uses Maliit for the same job --
+# there is an LG build of it in code/maliit-framework-webos-1.1.0-86.
+maliit-framework
+maliit-keyboard
+
+# --- theme ------------------------------------------------------------
+# Missing these gives a shell with no decorations, cursor or colour scheme,
+# which renders as a black screen even though it is running.
+breeze
+breeze-icons
+plasma-workspace-wallpapers
+
+# --- browser ----------------------------------------------------------
+chromium
+chromium-chromedriver

@@ -1,0 +1,201 @@
+#!/bin/sh
+# Run once at boot by busybox init (::sysinit in /etc/inittab).
+# Keep everything here idempotent.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# LG's PM governor hot-plugs CPUs at runtime under load -- chip/o22/pm calls
+# cpu_down()/cpu_up() from pm_o22_func.c, and mp_enable defaults to 1. On a
+# kexec'd kernel this correlates with random SIGSEGV/SIGBUS in userspace,
+# including "Attempted to kill init!" panics during heavy load (package
+# installs, Plasma startup). boot_kernel.sh already disables it on the stock
+# kernel before kexec; the new kernel starts its own governor, so turn it off
+# again here, as early as possible.
+[ -w /proc/lg/pm/mp_enable ] && echo 0 > /proc/lg/pm/mp_enable
+
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null
+mount -t tmpfs  tmpfs  /run     2>/dev/null
+mount -o remount,rw / 2>/dev/null
+hostname -F /etc/hostname 2>/dev/null
+swapon -a 2>/dev/null
+
+ip link set lo up 2>/dev/null || ifconfig lo up
+if [ -e /sys/class/net/eth0 ]; then
+	ip link set eth0 up 2>/dev/null || ifconfig eth0 up
+	udhcpc -i eth0 -b -q >/dev/null 2>&1
+
+	# Fixed secondary address, in ADDITION to whatever DHCP hands out (it
+	# does not disturb the lease). With no serial console, a DHCP failure
+	# would otherwise mean no way in at all short of rebooting into stock
+	# webOS. To use it, put the other machine on the same /24:
+	#     ip addr add 10.213.0.2/24 dev <nic>
+	# Delete this line if 10.213.0.0/24 collides with a real network.
+	ip addr add 10.213.0.1/24 dev eth0 2>/dev/null
+fi
+
+# ---------------------------------------------------------------- remote shell
+# Unauthenticated root shell on tcp/23, so the TV is usable without the UART.
+#
+# "telnetd -l /bin/sh" skips login(1) altogether: no password, no host key,
+# nothing that changes when the stick is rebuilt -- which is the whole point
+# here. The flip side is that anyone who can reach port 23 on this LAN gets
+# root with no credential at all. Fine for a TV on a lab network, not fine on
+# anything shared; swap in dropbear (password or key auth) once the serial
+# console is back.
+#
+# telnetd comes from busybox-extras, not Alpine's base busybox. It needs
+# /dev/pts, which is mounted above.
+if command -v telnetd >/dev/null 2>&1 && ! pgrep telnetd >/dev/null 2>&1; then
+	telnetd -l /bin/sh
+fi
+
+# Show the addresses on the panel itself. Without a serial console this is the
+# only way to learn what DHCP handed out -- the framebuffer console is already
+# enabled for the tty1 getty, so this lands on screen during boot.
+{
+	echo
+	echo "===================================================="
+	echo "  remote shell (no password):"
+	for _a in $(ip addr show dev eth0 2>/dev/null \
+	            | awk '$1 == "inet" { split($2, f, "/"); print f[1] }'); do
+		echo "      telnet $_a"
+	done
+	echo "===================================================="
+	echo
+} > /dev/tty1 2>/dev/null
+
+# This board has no RTC, so the clock starts at the epoch and anything
+# timestamp-sensitive (TLS, apk, make) misbehaves. Floor it at the rootfs
+# mtime, then correct over the network if ntpd is available.
+REF=$(date -r /etc/hostname '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+[ -n "$REF" ] && date -s "$REF" >/dev/null 2>&1
+command -v ntpd >/dev/null 2>&1 && ntpd -q -n -p pool.ntp.org >/dev/null 2>&1 &
+
+# udev. libinput enumerates input devices through udev and only accepts ones
+# tagged ID_INPUT=1 by its input_id builtin. With no udevd running nothing is
+# tagged, so a Wayland compositor comes up with no keyboard at all -- the
+# devices exist in /dev/input and evtest sees them, but the session does not.
+if command -v udevd >/dev/null 2>&1 && [ ! -e /run/udev/control ]; then
+	udevd --daemon
+	udevadm trigger --type=subsystems --action=add
+	udevadm trigger --type=devices --action=add
+	udevadm settle --timeout=10
+fi
+
+# seatd brokers DRM and input device access for the compositor. kwin and
+# wlroots both reach it through libseat.
+#
+# Deliberately seatd and not elogind. elogind was tried, to get
+# org.freedesktop.login1 (session management, and the suspend/hibernate calls
+# PowerDevil drives). It regressed a working Bigscreen: kwin opens DRM devices
+# through libseat, and logind only hands over devices attached to a seat the
+# session is on, so with no registered session kwin reported "No suitable DRM
+# devices have been found" and exited. Revisit only alongside a real PAM login
+# (pam_elogind.so registers the session) and check `loginctl` lists one before
+# expecting kwin to work.
+# Group "video", not root: the session runs as an unprivileged user, because
+# Firefox, Chromium and VLC all refuse to run as root. seatd's socket is
+# mode 0770 owned by root:<group>, so the session user must be in that group.
+if command -v seatd >/dev/null 2>&1 && [ ! -e /run/seatd.sock ]; then
+	seatd -g video >/dev/null 2>&1 &
+fi
+
+# kwin refuses to start Xwayland if /tmp/.X11-unix lacks the sticky bit, and
+# without Xwayland every Qt app that falls back to the xcb platform plugin
+# dies -- which takes down parts of the Plasma session with it.
+mkdir -p /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix
+
+# Same story for ICE: ksmserver creates /tmp/.ICE-unix itself only when it is
+# root. Running the session unprivileged it cannot, logs
+#   _IceTransmkdir: ERROR: euid != 0, directory /tmp/.ICE-unix will not be created
+# and session management never starts -- which takes down
+# org.freedesktop.Notifications and hangs the session on WaitForName.
+mkdir -p /tmp/.ICE-unix
+chmod 1777 /tmp/.ICE-unix
+
+# D-Bus. Plasma will not start without a system bus, and nothing else here
+# provides one -- there is no systemd and busybox init does not start it.
+if command -v dbus-daemon >/dev/null 2>&1; then
+	# dbus refuses to start without a machine-id, normally created by
+	# systemd-machine-id-setup.
+	[ -s /etc/machine-id ] || dbus-uuidgen --ensure=/etc/machine-id
+	mkdir -p /var/lib/dbus
+	[ -e /var/lib/dbus/machine-id ] || ln -sf /etc/machine-id /var/lib/dbus/machine-id
+	mkdir -p /run/dbus
+	[ -e /run/dbus/system_bus_socket ] || dbus-daemon --system --fork
+fi
+
+# bluetoothd, for the Magic Remote (BLE HID). Needs the system bus, so it goes
+# after the D-Bus block. Firmware is not shipped here -- the MediaTek patch
+# blob lives on the stock eMMC rootfs (mt7668_patch_e2_hdr.bin /
+# mt7663_patch_e2_hdr.bin), and btusb requests it as
+# mediatek/mt7668pr2h.bin, so it needs to be reachable under that name.
+# Alpine installs bluetoothd under libexec, not in PATH, so look for it.
+BLUETOOTHD=""
+for b in /usr/lib/bluetooth/bluetoothd /usr/libexec/bluetooth/bluetoothd \
+         /usr/sbin/bluetoothd /usr/bin/bluetoothd; do
+	[ -x "$b" ] && BLUETOOTHD="$b" && break
+done
+if [ -n "$BLUETOOTHD" ] && ! pgrep bluetoothd >/dev/null 2>&1; then
+	mkdir -p /var/lib/bluetooth
+	"$BLUETOOTHD" >/dev/null 2>&1 &
+fi
+
+# LG Magic Remote. magic-remote connects it over BLE and hands off to the
+# magicremote daemon, which decodes LG's private HID reports into uinput
+# events -- the remote's HID descriptor declares no usages, so the kernel
+# gives us a hidraw node and no evdev device.
+#
+# Run as root and from here rather than from the session: it needs
+# /dev/hidraw* and /dev/uinput, and this way the remote works at the console
+# too. magicremote reopens the device by itself when the remote sleeps and
+# wakes, so the outer loop only has to cover the Bluetooth connect failing
+# (typically because the remote is asleep at boot and has not advertised yet).
+if command -v magic-remote >/dev/null 2>&1 && ! pgrep magicremote >/dev/null 2>&1; then
+	( while true; do
+		magic-remote >/dev/null 2>&1
+		sleep 10
+	  done ) &
+fi
+
+# ---------------------------------------------------------------- session user
+# Unprivileged user to run the desktop as. Plenty of apps (firefox, chromium,
+# vlc) simply exit when uid 0, so a root session is not usable for a TV.
+#
+# video: /dev/dri/* and the seatd socket.  input: /dev/input/event*.
+# Without logind there is nothing to set per-login ACLs on those nodes, so
+# group membership is what grants access.
+SESSION_USER=tv
+SESSION_PASSWORD=alpine
+if ! id "$SESSION_USER" >/dev/null 2>&1; then
+	# -D creates the account with the password field locked.
+	adduser -D -s /bin/ash "$SESSION_USER"
+fi
+
+# Give the account a real password so it is usable for ssh, doas and the
+# Plasma lock screen -- a locked account cannot unlock its own session.
+# Only applied when there is no usable hash yet, so a password changed later
+# with passwd(1) is not clobbered on the next boot.
+case "$(awk -F: -v u="$SESSION_USER" '$1 == u { print $2 }' /etc/shadow 2>/dev/null)" in
+	"" | "!" | "!!" | "*" | "!*")
+		echo "$SESSION_USER:$SESSION_PASSWORD" | chpasswd 2>/dev/null \
+			&& echo "rc-local: set initial password for $SESSION_USER"
+		;;
+esac
+
+# Outside the creation guard on purpose. /etc/passwd persists on the stick, so
+# once the user exists this block is the only thing that can still fix its
+# groups -- and getting them wrong costs you input devices while DRM keeps
+# working (seatd brokers DRM, but libinput needs the input group), which is a
+# confusing way to fail. addgroup is idempotent.
+for g in video input audio render seat; do
+	getent group "$g" >/dev/null 2>&1 && addgroup "$SESSION_USER" "$g" 2>/dev/null
+done
+
+# XDG_RUNTIME_DIR. systemd-logind would normally create this per login.
+SESSION_UID="$(id -u "$SESSION_USER" 2>/dev/null || echo 0)"
+mkdir -p "/run/user/$SESSION_UID"
+chown "$SESSION_USER" "/run/user/$SESSION_UID" 2>/dev/null || true
+chmod 0700 "/run/user/$SESSION_UID"

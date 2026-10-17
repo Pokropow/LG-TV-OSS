@@ -1,0 +1,7 @@
+::sysinit:/sbin/rc-local
+ttyAMA0::respawn:/sbin/getty -n -l /bin/sh -L ttyAMA0 115200 vt100
+# Second shell on the panel itself; needs CONFIG_FRAMEBUFFER_CONSOLE=y and a
+# USB keyboard, and is the way back in if the serial console is unavailable.
+tty1::respawn:/sbin/getty -n -l /bin/sh 38400 tty1
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r

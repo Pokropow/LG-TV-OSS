@@ -1,0 +1,26 @@
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_decoder.c b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_decoder.c
+index 7b713ddcc..8cb59aafb 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_decoder.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_decoder.c
+@@ -58,7 +58,7 @@ logm_define (alsadec, log_level_info);
+ 
+ #define debug_call() debug("ALSA_CALL# %s(): %ld %ld %ld", __func__, ucontrol->value.integer.value[0], ucontrol->value.integer.value[1], ucontrol->value.integer.value[2])
+ 
+-#define ALSA_ADEC_INT_MIN (0x80000000)
++#define ALSA_ADEC_INT_MIN (-2147483647 - 1)
+ #define ALSA_ADEC_INT_MAX (0x7FFFFFFF)
+ 
+ #define ALSA_HDMI_IN_MAX (4)
+diff --git a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_se.c b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_se.c
+index 216edb487..0659d367d 100644
+--- a/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_se.c
++++ b/linux-and-kdriver_okapi-3/kdriver/core/aud/alsa/alsa_se.c
+@@ -56,7 +56,7 @@
+ /*------------------------------------------------------------------------------
+     Constant Definitions
+ ------------------------------------------------------------------------------*/
+-#define SE_INT_MIN              (0x80000000)
++#define SE_INT_MIN              (-2147483647 - 1)
+ #define SE_INT_MAX              (0x7FFFFFFF)
+ #define SE_PORT_DOWNMIX         (1)     // 8ch
+ #define SE_PORT_NORMAL          (0)     // 2ch
