@@ -3,7 +3,7 @@ set +x
 IP=$1
 ssh root@$IP "mkdir -p os_loader" 2>/dev/null
 
-files=(kexec/sbin/kexec Image boot-initramfs.cpio.gz)
+files=(kexec/sbin/kexec Image boot-initramfs.cpio.gz modules/fix_stuck_cpus.ko)
 
 for file in "${files[@]}"; do
     if [ ! -f build/$file ]; then

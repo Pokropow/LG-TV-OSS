@@ -37,7 +37,7 @@ set -u
 # Not derived from $0: when the script is piped in over ssh ("bash -s") there
 # is no script file, $0 is "bash", and dirname gives ".". Hardcode the payload
 # directory instead, overridable for anyone who puts it elsewhere.
-MY_STUFF="${MY_STUFF:-/home/root/my_stuff}"
+MY_STUFF="${MY_STUFF:-/home/root/os_loader}"
 cd "$MY_STUFF" || { echo "boot_kernel: no $MY_STUFF" >&2; exit 1; }
 
 # Only look for the env file if the values are not already in the environment
@@ -100,10 +100,10 @@ UNIT="$UNIT pqe.tool=$TV_PQE_TOOL pqe.year=$TV_PQE_YEAR rev=$TV_REV"
 CMDLINE="$OURS $UNIT"
 
 # ---------------------------------------------------------------------- load
+# --dtb="$MY_STUFF/tv.dtb" \
 until ./kexec --no-checks \
-	-l "$MY_STUFF/Image" \
-	--initrd="$MY_STUFF/boot-initramfs.cpio.gz" \
-	--dtb="$MY_STUFF/tv.dtb" \
+	-l "Image" \
+	--initrd="boot-initramfs.cpio.gz" \
 	--command-line="$CMDLINE"
 do
 	echo "Retrying kernel load"
