@@ -2,6 +2,8 @@
 
 This project is attempting to boot custom linux on LG smart TV (OLED65C21LA). This project uses kexec to execute custom kernel in memory without any need to override system files present in stock os.
 
+![plot](./media/fastfetch.jpg)
+
 # Building and running
 
 Build everything, then deploy and boot in one command:
