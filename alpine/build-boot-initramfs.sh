@@ -9,11 +9,16 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)"
 # Assets and build outputs live in the project root, one level up.
 HERE="$(cd "$SELF/.." && pwd)"
-BB="${BUSYBOX:-$HERE/initramfs/bin/busybox}"
-ROOT="$HERE/boot-initramfs-root"
-OUT="$HERE/boot-initramfs.cpio.gz"
+BB="${BUSYBOX:-$HERE/build/busybox/busybox}"
+ROOT="/tmp/boot-initramfs-root"
+OUT="$HERE/build/boot-initramfs.cpio.gz"
 
-[ -x "$BB" ] || { echo "need an aarch64 busybox at $BB (or set BUSYBOX=)" >&2; exit 1; }
+[ -x "$BB" ] || {
+	echo "no aarch64 busybox at $BB" >&2
+	echo "build it with:  sh alpine/build.sh   (from the project root)" >&2
+	echo "or point BUSYBOX= at a static aarch64 binary you already have" >&2
+	exit 1
+}
 
 rm -rf "$ROOT"
 # One per line: brace expansion is bash-only, and this breaks silently
@@ -26,68 +31,44 @@ chmod +x "$ROOT/bin/busybox"
 
 # static busybox: install the applet symlinks now rather than at runtime,
 # because /init runs before anything could call `busybox --install`
-for a in sh mount umount switch_root sleep echo cat ls mkdir blkid findfs \
-         dmesg mknod grep sed awk chroot test seq \
-         reboot poweroff halt sync ln rm cp mv vi ps kill df free; do
+APPLETS="sh mount umount switch_root sleep echo cat ls mkdir blkid findfs
+         dmesg mknod grep sed awk chroot test seq
+         reboot poweroff halt sync ln rm cp mv vi ps kill df free"
+
+# A symlink to an applet this busybox was not built with is a dead link that
+# nothing notices until /init needs it, mid-boot, with no way to debug. Read
+# the applet table out of the binary rather than running it: the binary is
+# aarch64, and executing it here depends on qemu binfmt, which is both
+# optional and -- observed while writing this -- occasionally flaky.
+# Dump the table once to a file and grep the file: `strings ... | grep -q`
+# would have grep exit on the first match, kill strings with SIGPIPE, and
+# -o pipefail then reports every single applet as missing.
+APPLET_LIST="$(mktemp)"
+trap 'rm -f "$APPLET_LIST"' EXIT
+# -n 2, because strings defaults to a 4-character minimum and would hide
+# sh, ls, ln, rm, cp, mv, vi, ps and df -- half the list. This is a sanity
+# check on a NUL-separated name table, not a proof: a two-letter name could
+# in principle match some unrelated run of bytes.
+strings -a -n 2 "$BB" > "$APPLET_LIST"
+missing=""
+for a in $APPLETS; do
+	grep -qx "$a" "$APPLET_LIST" || missing="$missing $a"
+done
+[ -z "$missing" ] || {
+	echo "busybox at $BB lacks these applets:$missing" >&2
+	echo "enable them in alpine/build_busybox.sh and rebuild" >&2
+	exit 1
+}
+
+for a in $APPLETS; do
 	ln -sf /bin/busybox "$ROOT/bin/$a"
 done
 ln -sf /bin/busybox "$ROOT/sbin/switch_root"
 
-cat > "$ROOT/init" <<'INIT'
-#!/bin/busybox sh
-export PATH=/bin:/sbin
-
-/bin/busybox mount -t proc     proc     /proc
-/bin/busybox mount -t sysfs    sysfs    /sys
-/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
-
-log()  { echo "[boot] $*"; }
-fail() { echo "[boot] FAILED: $*"; echo "[boot] dropping to shell -- 'reboot -f' to restart, 'blkid' to inspect disks"; exec /bin/sh; }
-
-# The LG USB controller is behind a deferred user_initcall -- without this
-# no USB device ever appears. See drivers/soc/lg1k/usb.c: user_initcall_grp("USB",...)
-if [ -w /proc/usercalls ]; then
-	log "starting USB subsystem"
-	echo USB > /proc/usercalls
-fi
-
-log "Disable cpu hotplug"
-echo 0 > /proc/lg/pm/mp_enable
-
-# root=... from the kernel cmdline; accepts LABEL=, UUID= or a device path.
-ROOTSPEC=$(sed -n 's/.*\broot=\([^ ]*\).*/\1/p' /proc/cmdline)
-[ -n "$ROOTSPEC" ] || ROOTSPEC="LABEL=alpineroot"
-ROOTFLAGS=$(sed -n 's/.*\brootflags=\([^ ]*\).*/\1/p' /proc/cmdline)
-log "looking for root=$ROOTSPEC"
-
-DEV=""
-i=0
-while [ $i -lt 150 ]; do          # ~15s; USB enumeration is not instant
-	case "$ROOTSPEC" in
-		LABEL=*|UUID=*|PARTUUID=*) DEV=$(findfs "$ROOTSPEC" 2>/dev/null) ;;
-		*)                         [ -b "$ROOTSPEC" ] && DEV="$ROOTSPEC" ;;
-	esac
-	[ -n "$DEV" ] && [ -b "$DEV" ] && break
-	DEV=""
-	sleep 0.1
-	i=$((i+1))
-done
-
-[ -n "$DEV" ] || fail "no root device matching $ROOTSPEC after 15s (is the stick plugged in?)"
-log "found $DEV"
-
-mount -o rw${ROOTFLAGS:+,$ROOTFLAGS} "$DEV" /newroot || fail "mount $DEV"
-[ -x /newroot/sbin/init ] || fail "$DEV has no /sbin/init -- wrong partition?"
-
-# hand the pseudo-filesystems over rather than remounting them on the far side
-mount --move /dev  /newroot/dev  2>/dev/null
-mount --move /proc /newroot/proc 2>/dev/null
-mount --move /sys  /newroot/sys  2>/dev/null
-
-log "switch_root -> $DEV"
-exec switch_root /newroot /sbin/init
-INIT
-chmod +x "$ROOT/init"
+# The init is a file of its own rather than a heredoc: it is the thing that
+# actually runs as PID 1 on the TV, and it is worth being able to read, diff
+# and shellcheck it without the build script in the way.
+install -m 0755 "$SELF/boot-initramfs-init.sh" "$ROOT/init"
 
 ( cd "$ROOT" && find . | cpio -o -H newc --owner root:root 2>/dev/null ) | gzip -9 > "$OUT"
 echo "built: $OUT  ($(du -h "$OUT" | cut -f1))"

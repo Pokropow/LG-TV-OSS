@@ -2,3 +2,13 @@ alpine/alpine-rootfs
 # Per-unit values: MAC address, serial number, sbkey, AVS calibration.
 # Copy tv-env.example.sh to tv-env.sh and fill in from your own set.
 tv-env.sh
+
+build/
+code
+custom/fix_stuck_cpus/*.order
+custom/fix_stuck_cpus/*.symvers
+custom/fix_stuck_cpus/*.o
+custom/fix_stuck_cpus/*.cmd
+custom/fix_stuck_cpus/*.ko
+custom/fix_stuck_cpus/*.mod
+webos24 # <- linux kernel

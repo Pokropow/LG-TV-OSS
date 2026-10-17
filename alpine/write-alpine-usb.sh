@@ -14,6 +14,8 @@ HERE="$(cd "$SELF/.." && pwd)"
 DEV="${1:-}"
 MNT="$(mktemp -d)"
 
+ROOTFS=build/alpine-rootfs
+
 die() { echo "error: $*" >&2; exit 1; }
 [ -n "$DEV" ] || die "usage: $0 /dev/sdX   (the whole device, not a partition)"
 [ "$(id -u)" = 0 ] || die "must run as root (mkfs/mount)"

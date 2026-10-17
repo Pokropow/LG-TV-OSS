@@ -51,10 +51,7 @@ fi
 
 # ---------------------------------------------------------------- unpack
 echo "==> unpacking into $ROOTFS"
-rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
-tree "$ROOTFS"
-sleep 10
 tar -xzf "$HERE/$TARBALL" -C "$ROOTFS"
 # Listed one per line on purpose: brace expansion is a bash feature, and this
 # script also runs under busybox ash inside the build container, where
@@ -99,8 +96,9 @@ else
 	echo "==> WARNING: not aarch64 or no compiler, skipping tools/"
 fi
 
-chroot alpine-rootfs/ apk update
-chroot alpine-rootfs/ apk add $(cat packages.txt | grep -o '^[^#]*')
+chroot $ROOTFS apk update
+chroot $ROOTFS apk add $(cat packages.txt | grep -o '^[^#]*')
 
-rm -rf /root/alpine-workspace/*
-mv alpine-rootfs/* /root/alpine-workspace/
+mkdir -p /root/build/alpine-rootfs/
+rm -rf /root/build/alpine-rootfs/*
+mv $ROOTFS/* /root/build/alpine-rootfs/
